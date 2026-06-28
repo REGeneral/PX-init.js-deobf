@@ -1,4 +1,3 @@
-// @license Copyright (C) 2012-2026 HUMAN Security, Inc (www.humansecurity.com). Content of this file can not be copied and/or distributed.
 (function() {
     try {
         window._pxAppId = "PXlsXlyYa5";
