@@ -24,7 +24,10 @@ grep -c 'with ('   init.js   (>0 -> with/switch flattening)
 ```
 node pxclean.js init.js out.js --report
 ```
-Dependencies: @babel/parser, @babel/traverse, @babel/generator, @babel/types
+Dependencies: 
+```
+npm i @babel/parser @babel/traverse @babel/generator @babel/types
+```
 
 The output is for reading/analysis, not for re-running on the site (pre sure PX self checks its own source). It's guaranteed to be valid syntax wise, the tool reparses the result and aborts without writing if anything is malformed.
 
