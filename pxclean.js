@@ -1,4 +1,5 @@
 const fs = require("fs");
+const vm = require("vm");
 const parser = require("@babel/parser");
 const traverse = require("@babel/traverse").default;
 const generate = require("@babel/generator").default;
@@ -165,7 +166,103 @@ function deadCodeEliminate(src) {
     };
 }
 
+
+function normalizeSource(code) {
+    if (/^\/\/[^\n]*distributed\.[ \t]+\S/.test(code.slice(0, 600)))
+        return code.replace(/^(\/\/[^\n]*?distributed\.)[ \t]+(?=\S)/, "$1\n");
+    return code;
+}
+
+function inlineObfuscatorIO(ast) {
+    // 1. providers: a function whose body builds a sizable string array
+    const providers = new Map();           // name -> path
+    traverse(ast, {
+        "FunctionDeclaration|FunctionExpression"(path) {
+            const name = path.node.id ? path.node.id.name : (t.isVariableDeclarator(path.parent) ? path.parent.id.name : null);
+            if (!name || providers.has(name)) return;
+            let best = 0;
+            path.traverse({ ArrayExpression(a) {
+                const els = a.node.elements, strs = els.filter(e => t.isStringLiteral(e)).length;
+                if (els.length >= 10 && strs >= els.length * 0.6 && els.length > best) best = els.length;
+            }});
+            if (best >= 10) providers.set(name, path);
+        },
+    });
+    if (!providers.size) return 0;
+    // 2. accessors: 1-2 param fn that calls a provider AND indexes with an offset
+    const accessors = [];                  // { name, providerName, path, binding }
+    traverse(ast, {
+        "FunctionDeclaration|FunctionExpression"(path) {
+            if (path.node.params.length < 1 || path.node.params.length > 2) return;
+            const name = path.node.id ? path.node.id.name : (t.isVariableDeclarator(path.parent) ? path.parent.id.name : null);
+            if (!name) return;
+            let providerName = null, hasOffset = false;
+            path.traverse({
+                CallExpression(c) { if (t.isIdentifier(c.node.callee) && providers.has(c.node.callee.name)) providerName = c.node.callee.name; },
+                BinaryExpression(b) { if (b.node.operator === "-" && t.isNumericLiteral(b.node.right)) hasOffset = true; },
+                AssignmentExpression(a) { if (a.node.operator === "-=" && t.isNumericLiteral(a.node.right)) hasOffset = true; },
+            });
+            if (!providerName || !hasOffset) return;
+            const binding = (path.scope.parent || path.scope).getBinding(name);
+            if (binding) accessors.push({ name, providerName, path, binding });
+        },
+    });
+    if (!accessors.length) return 0;
+    // 3. rotators: IIFE statement referencing a provider with push + shift
+    const rotators = new Map();            // providerName -> [stmt nodes]
+    traverse(ast, {
+        ExpressionStatement(path) {
+            let prov = null, push = false, shift = false;
+            path.traverse({ Identifier(i) {
+                if (providers.has(i.node.name)) prov = i.node.name;
+                if (i.node.name === "push") push = true;
+                if (i.node.name === "shift") shift = true;
+            }});
+            if (prov && push && shift) { if (!rotators.has(prov)) rotators.set(prov, []); rotators.get(prov).push(path.node); }
+        },
+    });
+    // 4. execute each accessor's trio in a sandbox -> a live decode fn
+    const decl = (path, name) => t.isFunctionDeclaration(path.node) ? generate(path.node).code : ("var " + name + "=" + generate(path.node).code);
+    const liveByBinding = new Map();
+    for (const acc of accessors) {
+        try {
+            const provName = acc.providerName;
+            const rots = rotators.get(provName) || [];
+            if (!rots.length) continue;        // no rotator -> can't align the array. skip (avoid WRONG decodes)
+            const src = decl(providers.get(provName), provName) + ";\n" +
+                decl(acc.path, acc.name) + ";\n" +
+                rots.map(r => generate(r).code).join("\n");
+            const ctx = vm.createContext(Object.create(null));
+            vm.runInContext(src, ctx, { timeout: 3000 });
+            const live = vm.runInContext("typeof " + acc.name + "==='function'?" + acc.name + ":null", ctx, { timeout: 1000 });
+            if (typeof live === "function") liveByBinding.set(acc.binding, live);
+        } catch (e) { /* unresolvable trio -> leave its calls alone */ }
+    }
+    if (!liveByBinding.size) return 0;
+    // 5. inline constant accessor calls -> string literals (scope-bound)
+    let n = 0;
+    traverse(ast, {
+        CallExpression(path) {
+            const callee = path.node.callee, args = path.node.arguments;
+            if (!t.isIdentifier(callee) || args.length < 1 || args.length > 2) return;
+            const bind = path.scope.getBinding(callee.name);
+            if (!bind || !liveByBinding.has(bind)) return;
+            let idx = t.isNumericLiteral(args[0]) ? args[0].value
+                : (t.isUnaryExpression(args[0], { operator: "-" }) && t.isNumericLiteral(args[0].argument) ? -args[0].argument.value : null);
+            if (idx === null) return;
+            let key;
+            if (args.length === 2) { if (t.isStringLiteral(args[1])) key = args[1].value; else return; }
+            let s; try { s = key === undefined ? liveByBinding.get(bind)(idx) : liveByBinding.get(bind)(idx, key); } catch (e) { return; }
+            if (typeof s !== "string" || !isPrintable(s)) return;
+            path.replaceWith(t.stringLiteral(s));
+            n++;
+        },
+    });
+    return n;
+}
+
 function deobfuscate(code) {
+    code = normalizeSource(code);
     const ast = parser.parse(code, PARSE_OPTS);
     const accessorByBinding = buildResolvers(ast);
     console.error(`[deobf] string-table accessors bound: ${accessorByBinding.size}`);
@@ -250,6 +347,9 @@ function deobfuscate(code) {
         },
     });
     console.error(`[deobf] replaced: ${nB91} basE91 + ${nB64} base64  (dynamic/skipped: ${skipped})`);
+    // Pass 4b: obfuscator.io rotated string-arrays (PX base64 generation)
+    const nObf = inlineObfuscatorIO(ast);
+    console.error(`[deobf] obfuscator.io string-array calls inlined: ${nObf}`);
     // Pass 5: strip dead decoy closures "<rnd>" in <emptyObj> && (function(){…})()
     const BUILTIN_PROPS = new Set(["length", "name", "prototype", "constructor", "call", "apply", "bind",
         "toString", "valueOf", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "arguments", "caller",
@@ -298,7 +398,7 @@ function deobfuscate(code) {
         },
     });
     console.error(`[deobf] stripped dead decoy closures: ${nDecoy}`);
-    let out = generate(ast, GEN_OPTS, code).code;
+    let out = generate(ast, GEN_OPTS).code;
     // Pass 6: dead-function/var elimination
     const dce = deadCodeEliminate(out);
     out = dce.code;
@@ -483,7 +583,7 @@ function gatherBlock(cases, start) {
         terminal: "fallout"
     };
 }
-// Top-aware evaluation: a data variant accumulator becomes TOP, propagating
+// Top-aware evaluation: a data variant accumulator beocmes TOP, propagating
 const TOP = Symbol("TOP");
 
 function evalTop(node, env) {
@@ -616,8 +716,12 @@ function tx(node, ctx) {
         return node;
     }
     const out = Object.assign({}, node);
+    // a non-computed property/key is a FIXED name, not a variable — never rewrite it
+    // (otherwise `obj.foo` could become the invalid `obj.(S.foo)` when foo is a state name)
+    const skip = (!node.computed && (t.isMemberExpression(node) || t.isOptionalMemberExpression(node))) ? "property"
+        : (!node.computed && (t.isObjectProperty(node) || t.isObjectMethod(node) || t.isClassProperty(node) || t.isClassMethod(node))) ? "key" : null;
     for (const k of Object.keys(node)) {
-        if (k === "type" || k === "loc" || k === "start" || k === "end" || k === "range" ||
+        if (k === skip || k === "type" || k === "loc" || k === "start" || k === "end" || k === "range" ||
             k === "leadingComments" || k === "trailingComments" || k === "innerComments" || k.startsWith("_")) continue;
         const v = node[k];
         if (v && typeof v === "object") out[k] = tx(v, ctx);
@@ -1049,7 +1153,7 @@ function unflatten(code, REPORT) {
         linNames.push(`L${tr.loc}`);
     }
     console.error(`[unflat] machines linearized to straight-line code: ${nLinearized}  [${linNames.join(", ")}]`);
-    const outCode = generate(ast, GEN_OPTS, code).code;
+    const outCode = generate(ast, GEN_OPTS).code;
     try {
         parser.parse(outCode, {
             sourceType: "script",
