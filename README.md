@@ -10,7 +10,9 @@ Deobfuscator for PerimeterX's init.js file using babel.
 
 ## Which PX build this targets
 
-I reverse engineered this against the Human branded sensor whose obfuscation uses:
+**Please read the update section below this section prior to reading this!**
+
+I reverse engineered this against the HUMAN branded sensor whose obfuscation uses:
 
 - `basE91 string tables`: A big `hD[]` array decoded by `hE()` and `with(state) switch(sum)` control flow flattening.
 
@@ -19,6 +21,20 @@ A quick check to see if it's the right vers:
 grep -c '8191 & c' init.js   (>0 -> basE91 tables present)
 grep -c 'with ('   init.js   (>0 -> with/switch flattening)
 ```
+
+## Update: making it global across multiple obfuscation generations
+PX ships init.js in more than one obf generation, and the original version only handled one of them (basE91). It now runs on their other obf generation that I came across
+
+- **HUMAN basE91 + control flow flattening**: Some builds minify this without spaces around operators. It's the same generation, just don't rely on `grep '8191 & c'` / `grep 'with ('` to detect those (tool is AST based, so it still works).
+- **PX obfuscator.io generation**: instead of one `hD[]` basE91 table it uses many small rotated string arrays (`var t=[…]; return (P=function(){return t})()`) read through an accessor `A(i)=arr[i-OFFSET]`, after a push/shift rotator aligns the array. The strings are also base64 wrapped.
+
+Three bugs were fixed so it doesn't choke on these:
+
+- **Comment in the init.js**: Some captures lose the newline after a comment in the file which I originally removed manually. The leading `//` comments out the entire file and it parses to nothing. The tool now re-inserts the newline before parsing.
+- **Generator crash**: `Got a MemberExpression for MemberExpression property`, caused by handing the original source to babel's generator. The source map path chokes on mutated nodes, dropped it.
+- **Linearizer Bug**: The unflatter was rewriting the fixed property name in `obj.foo` into the invalid `obj.(S.foo)` when `foo` happened to match a state variable name. It now leaves non-computed property/key names alone.
+
+Some builds nest/alias their accessors (one accessor wraps another), which the per trio detection does not fully map, those calls are left as is. The base64 string layer still gets inlined so the file stays mostly readable. Fully resolving that nested case is a webcrack class job and isn't done here.
 
 ## Usage
 ```
